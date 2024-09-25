@@ -11,6 +11,7 @@ import {
   BasicBlock,
   BlockId,
   DependencyPathEntry,
+  FunctionExpression,
   GeneratedSource,
   HIRFunction,
   Identifier,
@@ -19,6 +20,11 @@ import {
   ReactiveScopeDependency,
   ScopeId,
 } from './HIR';
+import {
+  eachInstructionOperand,
+  eachInstructionValueLValue,
+  eachInstructionValueOperand,
+} from './visitors';
 
 /**
  * Helper function for `PropagateScopeDependencies`.
@@ -76,7 +82,12 @@ export function collectHoistablePropertyLoads(
 ): ReadonlyMap<ScopeId, BlockInfo> {
   const tree = new Tree();
 
-  const nodes = collectNonNullsInBlocks(fn, temporaries, optionals, tree);
+  const functionExpressionReferences = collectFunctionExpressionRValues(fn);
+  const realTemporaries = new Map(temporaries);
+  for (const reference of functionExpressionReferences) {
+    realTemporaries.delete(reference);
+  }
+  const nodes = collectNonNullsInBlocks(fn, realTemporaries, optionals, tree);
   propagateNonNull(fn, nodes, tree);
 
   const nodesKeyedByScopeId = new Map<ScopeId, BlockInfo>();
@@ -505,4 +516,39 @@ function reduceMaybeOptionalChains(
       }
     }
   } while (changed);
+}
+
+function collectFunctionExpressionRValues(fn: HIRFunction): Set<IdentifierId> {
+  const uses = new Map<IdentifierId, Set<IdentifierId>>();
+  const functionExpressionReferences = new Set<IdentifierId>();
+
+  for (const [_, block] of fn.body.blocks) {
+    for (const {lvalue, value} of block.instructions) {
+      if (value.kind === 'FunctionExpression') {
+        for (const reference of value.loweredFunc.dependencies) {
+          const queued = [reference.identifier.id];
+          while (queued.length > 0) {
+            const top = queued.pop()!;
+            functionExpressionReferences.add(top);
+            for (const reference of uses.get(top) ?? []) {
+              queued.push(reference);
+            }
+          }
+        }
+      } else {
+        const operands = [
+          ...eachInstructionValueOperand(value),
+          ...eachInstructionValueLValue(value),
+        ];
+        if (!operands.every(operand => operand.identifier.name == null)) {
+          continue;
+        }
+        uses.set(
+          lvalue.identifier.id,
+          new Set(operands.map(operand => operand.identifier.id)),
+        );
+      }
+    }
+  }
+  return functionExpressionReferences;
 }
