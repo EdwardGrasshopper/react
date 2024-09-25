@@ -4,6 +4,7 @@ import {Set_intersect, Set_union, getOrInsertDefault} from '../Utils/utils';
 import {
   BasicBlock,
   BlockId,
+  DependencyPathEntry,
   GeneratedSource,
   HIRFunction,
   Identifier,
@@ -66,7 +67,9 @@ export function collectHoistablePropertyLoads(
   fn: HIRFunction,
   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
 ): ReadonlyMap<ScopeId, BlockInfo> {
-  const nodes = collectNonNullsInBlocks(fn, temporaries);
+  const tree = new Tree();
+
+  const nodes = collectNonNullsInBlocks(fn, temporaries, tree);
   propagateNonNull(fn, nodes);
 
   const nodesKeyedByScopeId = new Map<ScopeId, BlockInfo>();
@@ -110,7 +113,7 @@ type PropertyLoadNode =
 class Tree {
   roots: Map<IdentifierId, RootNode> = new Map();
 
-  getOrCreateRoot(identifier: Identifier): PropertyLoadNode {
+  getOrCreateIdentifier(identifier: Identifier): PropertyLoadNode {
     /**
      * Reads from a statically scoped variable are always safe in JS,
      * with the exception of TDZ (not addressed by this pass).
@@ -132,40 +135,46 @@ class Tree {
     return rootNode;
   }
 
-  static #getOrCreateProperty(
-    node: PropertyLoadNode,
-    property: string,
+  static getOrCreatePropertyEntry(
+    parent: PropertyLoadNode,
+    entry: DependencyPathEntry,
   ): PropertyLoadNode {
-    let child = node.properties.get(property);
+    if (entry.optional) {
+      CompilerError.throwTodo({
+        reason: 'handle optional nodes',
+        loc: GeneratedSource,
+      });
+    }
+    let child = parent.properties.get(entry.property);
     if (child == null) {
       child = {
         properties: new Map(),
-        parent: node,
+        parent: parent,
         fullPath: {
-          identifier: node.fullPath.identifier,
-          path: node.fullPath.path.concat([{property, optional: false}]),
+          identifier: parent.fullPath.identifier,
+          path: parent.fullPath.path.concat(entry),
         },
       };
-      node.properties.set(property, child);
+      parent.properties.set(entry.property, child);
     }
     return child;
   }
 
-  getPropertyLoadNode(n: ReactiveScopeDependency): PropertyLoadNode {
+  getOrCreateProperty(n: ReactiveScopeDependency): PropertyLoadNode {
     /**
      * We add ReactiveScopeDependencies according to instruction ordering,
      * so all subpaths of a PropertyLoad should already exist
      * (e.g. a.b is added before a.b.c),
      */
-    let currNode = this.getOrCreateRoot(n.identifier);
+    let currNode = this.getOrCreateIdentifier(n.identifier);
     if (n.path.length === 0) {
       return currNode;
     }
     for (let i = 0; i < n.path.length - 1; i++) {
-      currNode = assertNonNull(currNode.properties.get(n.path[i].property));
+      currNode = Tree.getOrCreatePropertyEntry(currNode, n.path[i]);
     }
 
-    return Tree.#getOrCreateProperty(currNode, n.path.at(-1)!.property);
+    return Tree.getOrCreatePropertyEntry(currNode, n.path.at(-1)!);
   }
 }
 
@@ -194,19 +203,15 @@ function pushPropertyLoadNode(
     !isMutableAtInstr ||
     knownImmutableIdentifiers.has(node.fullPath.identifier.id)
   ) {
-    let curr: PropertyLoadNode | null = node;
-    while (curr != null) {
-      result.add(curr);
-      curr = curr.parent;
-    }
+    result.add(node);
   }
 }
 
 function collectNonNullsInBlocks(
   fn: HIRFunction,
   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+  tree: Tree,
 ): ReadonlyMap<BlockId, BlockInfo> {
-  const tree = new Tree();
   /**
    * Due to current limitations of mutable range inference, there are edge cases in
    * which we infer known-immutable values (e.g. props or hook params) to have a
@@ -235,7 +240,7 @@ function collectNonNullsInBlocks(
     fn.params[0].kind === 'Identifier'
   ) {
     const identifier = fn.params[0].identifier;
-    knownNonNullIdentifiers.add(tree.getOrCreateRoot(identifier));
+    knownNonNullIdentifiers.add(tree.getOrCreateIdentifier(identifier));
   }
   const nodes = new Map<BlockId, BlockInfo>();
   for (const [_, block] of fn.body.blocks) {
@@ -248,7 +253,7 @@ function collectNonNullsInBlocks(
           identifier: instr.value.object.identifier,
           path: [],
         };
-        const propertyNode = tree.getPropertyLoadNode(source);
+        const propertyNode = tree.getOrCreateProperty(source);
         pushPropertyLoadNode(
           propertyNode,
           instr.id,
@@ -263,7 +268,7 @@ function collectNonNullsInBlocks(
         const sourceNode = temporaries.get(source);
         if (sourceNode != null) {
           pushPropertyLoadNode(
-            tree.getPropertyLoadNode(sourceNode),
+            tree.getOrCreateProperty(sourceNode),
             instr.id,
             knownImmutableIdentifiers,
             assumedNonNullObjects,
@@ -277,7 +282,7 @@ function collectNonNullsInBlocks(
         const sourceNode = temporaries.get(source);
         if (sourceNode != null) {
           pushPropertyLoadNode(
-            tree.getPropertyLoadNode(sourceNode),
+            tree.getOrCreateProperty(sourceNode),
             instr.id,
             knownImmutableIdentifiers,
             assumedNonNullObjects,
@@ -319,7 +324,6 @@ function propagateNonNull(
     nodeId: BlockId,
     direction: 'forward' | 'backward',
     traversalState: Map<BlockId, 'active' | 'done'>,
-    nonNullObjectsByBlock: Map<BlockId, ReadonlySet<PropertyLoadNode>>,
   ): boolean {
     /**
      * Avoid re-visiting computed or currently active nodes, which can
@@ -350,7 +354,6 @@ function propagateNonNull(
           pred,
           direction,
           traversalState,
-          nonNullObjectsByBlock,
         );
         changed ||= neighborChanged;
       }
@@ -379,38 +382,36 @@ function propagateNonNull(
     const neighborAccesses = Set_intersect(
       Array.from(neighbors)
         .filter(n => traversalState.get(n) === 'done')
-        .map(n => assertNonNull(nonNullObjectsByBlock.get(n))),
+        .map(n => assertNonNull(nodes.get(n)).assumedNonNullObjects),
     );
 
-    const prevObjects = assertNonNull(nonNullObjectsByBlock.get(nodeId));
-    const newObjects = Set_union(prevObjects, neighborAccesses);
+    const prevObjects = assertNonNull(nodes.get(nodeId)).assumedNonNullObjects;
+    const mergedObjects = Set_union(prevObjects, neighborAccesses);
 
-    nonNullObjectsByBlock.set(nodeId, newObjects);
+    assertNonNull(nodes.get(nodeId)).assumedNonNullObjects = mergedObjects;
     traversalState.set(nodeId, 'done');
-    changed ||= prevObjects.size !== newObjects.size;
+    changed ||= prevObjects.size !== mergedObjects.size;
     return changed;
-  }
-  const fromEntry = new Map<BlockId, ReadonlySet<PropertyLoadNode>>();
-  const fromExit = new Map<BlockId, ReadonlySet<PropertyLoadNode>>();
-  for (const [blockId, blockInfo] of nodes) {
-    fromEntry.set(blockId, blockInfo.assumedNonNullObjects);
-    fromExit.set(blockId, blockInfo.assumedNonNullObjects);
   }
   const traversalState = new Map<BlockId, 'done' | 'active'>();
   const reversedBlocks = [...fn.body.blocks];
   reversedBlocks.reverse();
 
-  let i = 0;
   let changed;
+  let i = 0;
   do {
-    i++;
+    CompilerError.invariant(i++ < 100, {
+      reason:
+        '[CollectHoistablePropertyLoads] fixed point iteration did not terminate after 100 loops',
+      loc: GeneratedSource,
+    });
+
     changed = false;
     for (const [blockId] of fn.body.blocks) {
       const forwardChanged = recursivelyPropagateNonNull(
         blockId,
         'forward',
         traversalState,
-        fromEntry,
       );
       changed ||= forwardChanged;
     }
@@ -420,43 +421,14 @@ function propagateNonNull(
         blockId,
         'backward',
         traversalState,
-        fromExit,
       );
       changed ||= backwardChanged;
     }
     traversalState.clear();
   } while (changed);
-
-  /**
-   * TODO: validate against meta internal code, then remove in future PR.
-   * Currently cannot come up with a case that requires fixed-point iteration.
-   */
-  CompilerError.invariant(i <= 2, {
-    reason: 'require fixed-point iteration',
-    description: `#iterations = ${i}`,
-    loc: GeneratedSource,
-  });
-
-  CompilerError.invariant(
-    fromEntry.size === fromExit.size && fromEntry.size === nodes.size,
-    {
-      reason:
-        'bad sizes after calculating fromEntry + fromExit ' +
-        `${fromEntry.size} ${fromExit.size} ${nodes.size}`,
-      loc: GeneratedSource,
-    },
-  );
-
-  for (const [id, node] of nodes) {
-    const assumedNonNullObjects = Set_union(
-      assertNonNull(fromEntry.get(id)),
-      assertNonNull(fromExit.get(id)),
-    );
-    node.assumedNonNullObjects = assumedNonNullObjects;
-  }
 }
 
-function assertNonNull<T extends NonNullable<U>, U>(
+export function assertNonNull<T extends NonNullable<U>, U>(
   value: T | null | undefined,
   source?: string,
 ): T {
