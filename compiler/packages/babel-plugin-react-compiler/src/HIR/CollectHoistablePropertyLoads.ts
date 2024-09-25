@@ -1,6 +1,12 @@
 import {CompilerError} from '../CompilerError';
 import {inRange} from '../ReactiveScopes/InferReactiveScopeVariables';
-import {Set_intersect, Set_union, getOrInsertDefault} from '../Utils/utils';
+import {
+  Set_equal,
+  Set_filter,
+  Set_intersect,
+  Set_union,
+  getOrInsertDefault,
+} from '../Utils/utils';
 import {
   BasicBlock,
   BlockId,
@@ -66,11 +72,12 @@ import {
 export function collectHoistablePropertyLoads(
   fn: HIRFunction,
   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+  optionals: ReadonlyMap<BlockId, ReactiveScopeDependency>,
 ): ReadonlyMap<ScopeId, BlockInfo> {
   const tree = new Tree();
 
-  const nodes = collectNonNullsInBlocks(fn, temporaries, tree);
-  propagateNonNull(fn, nodes);
+  const nodes = collectNonNullsInBlocks(fn, temporaries, optionals, tree);
+  propagateNonNull(fn, nodes, tree);
 
   const nodesKeyedByScopeId = new Map<ScopeId, BlockInfo>();
   for (const [_, block] of fn.body.blocks) {
@@ -96,17 +103,21 @@ export type BlockInfo = {
  */
 type RootNode = {
   properties: Map<string, PropertyLoadNode>;
+  optionalProperties: Map<string, PropertyLoadNode>;
   parent: null;
   // Recorded to make later computations simpler
   fullPath: ReactiveScopeDependency;
+  hasOptional: boolean;
   root: IdentifierId;
 };
 
 type PropertyLoadNode =
   | {
       properties: Map<string, PropertyLoadNode>;
+      optionalProperties: Map<string, PropertyLoadNode>;
       parent: PropertyLoadNode;
       fullPath: ReactiveScopeDependency;
+      hasOptional: boolean;
     }
   | RootNode;
 
@@ -124,10 +135,12 @@ class Tree {
       rootNode = {
         root: identifier.id,
         properties: new Map(),
+        optionalProperties: new Map(),
         fullPath: {
           identifier,
           path: [],
         },
+        hasOptional: false,
         parent: null,
       };
       this.roots.set(identifier.id, rootNode);
@@ -139,23 +152,20 @@ class Tree {
     parent: PropertyLoadNode,
     entry: DependencyPathEntry,
   ): PropertyLoadNode {
-    if (entry.optional) {
-      CompilerError.throwTodo({
-        reason: 'handle optional nodes',
-        loc: GeneratedSource,
-      });
-    }
-    let child = parent.properties.get(entry.property);
+    const map = entry.optional ? parent.optionalProperties : parent.properties;
+    let child = map.get(entry.property);
     if (child == null) {
       child = {
         properties: new Map(),
+        optionalProperties: new Map(),
         parent: parent,
         fullPath: {
           identifier: parent.fullPath.identifier,
           path: parent.fullPath.path.concat(entry),
         },
+        hasOptional: parent.hasOptional || entry.optional,
       };
-      parent.properties.set(entry.property, child);
+      map.set(entry.property, child);
     }
     return child;
   }
@@ -210,6 +220,7 @@ function pushPropertyLoadNode(
 function collectNonNullsInBlocks(
   fn: HIRFunction,
   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
+  optionals: ReadonlyMap<BlockId, ReactiveScopeDependency>,
   tree: Tree,
 ): ReadonlyMap<BlockId, BlockInfo> {
   /**
@@ -247,6 +258,16 @@ function collectNonNullsInBlocks(
     const assumedNonNullObjects = new Set<PropertyLoadNode>(
       knownNonNullIdentifiers,
     );
+
+    nodes.set(block.id, {
+      block,
+      assumedNonNullObjects,
+    });
+    const maybeOptionalChain = optionals.get(block.id);
+    if (maybeOptionalChain != null) {
+      assumedNonNullObjects.add(tree.getOrCreateProperty(maybeOptionalChain));
+      continue;
+    }
     for (const instr of block.instructions) {
       if (instr.value.kind === 'PropertyLoad') {
         const source = temporaries.get(instr.value.object.identifier.id) ?? {
@@ -290,11 +311,6 @@ function collectNonNullsInBlocks(
         }
       }
     }
-
-    nodes.set(block.id, {
-      block,
-      assumedNonNullObjects,
-    });
   }
   return nodes;
 }
@@ -302,6 +318,7 @@ function collectNonNullsInBlocks(
 function propagateNonNull(
   fn: HIRFunction,
   nodes: ReadonlyMap<BlockId, BlockInfo>,
+  tree: Tree,
 ): void {
   const blockSuccessors = new Map<BlockId, Set<BlockId>>();
   const terminalPreds = new Set<BlockId>();
@@ -387,10 +404,15 @@ function propagateNonNull(
 
     const prevObjects = assertNonNull(nodes.get(nodeId)).assumedNonNullObjects;
     const mergedObjects = Set_union(prevObjects, neighborAccesses);
+    reduceMaybeOptionalChains(mergedObjects, tree);
 
     assertNonNull(nodes.get(nodeId)).assumedNonNullObjects = mergedObjects;
     traversalState.set(nodeId, 'done');
-    changed ||= prevObjects.size !== mergedObjects.size;
+    /**
+     * Note that it might not sufficient to compare set sizes since reduceMaybeOptionalChains
+     * may replace optional-chain loads with unconditional loads
+     */
+    changed ||= !Set_equal(prevObjects, mergedObjects);
     return changed;
   }
   const traversalState = new Map<BlockId, 'done' | 'active'>();
@@ -438,4 +460,49 @@ export function assertNonNull<T extends NonNullable<U>, U>(
     loc: GeneratedSource,
   });
   return value;
+}
+
+/**
+ * Any two optional chains with different operations . vs ?. but the same set of
+ * property strings paths de-duplicates.
+ *
+ * Intuitively: given <base>?.b, we know <base> to be either hoistable or not.
+ * If <base> is hoistable, we can replace all <base>?.PROPERTY_STRING subpaths
+ * with <base>.PROPERTY_STRING
+ */
+function reduceMaybeOptionalChains(
+  nodes: Set<PropertyLoadNode>,
+  tree: Tree,
+): void {
+  let optionalChainNodes = Set_filter(nodes, n => n.hasOptional);
+  if (optionalChainNodes.size === 0) {
+    return;
+  }
+  const knownNonNulls = new Set(nodes);
+  let changed: boolean;
+  do {
+    changed = false;
+
+    for (const original of optionalChainNodes) {
+      let {identifier, path: origPath} = original.fullPath;
+      let currNode: PropertyLoadNode = tree.getOrCreateIdentifier(identifier);
+      for (let i = 0; i < origPath.length; i++) {
+        const entry = origPath[i];
+        // If the base is known to be non-null, replace with a non-optional load
+        const nextEntry: DependencyPathEntry =
+          entry.optional && knownNonNulls.has(currNode)
+            ? {property: entry.property, optional: false}
+            : entry;
+        currNode = Tree.getOrCreatePropertyEntry(currNode, nextEntry);
+      }
+      if (currNode !== original) {
+        changed = true;
+        optionalChainNodes.delete(original);
+        optionalChainNodes.add(currNode);
+        nodes.delete(original);
+        nodes.add(currNode);
+        knownNonNulls.add(currNode);
+      }
+    }
+  } while (changed);
 }
